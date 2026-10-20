@@ -45,6 +45,18 @@ Before starting, edit `config.json`:
 
 On Windows, use `Copy-Item config.example.json config.json`, build with `go build -o opencode2api.exe ./cmd/opencode2api`, then run `.\opencode2api.exe -config config.json`.
 
+### Helper scripts
+
+On Linux, macOS, or WSL, the repository includes wrappers for a local background service:
+
+```bash
+./build.sh
+./start.sh
+./stop.sh
+```
+
+`build.sh` writes `./opencode2api` by default and embeds a version from `git describe`. `start.sh` requires `config.json`, starts the binary in the background, and writes `.local/opencode2api.pid` and `.local/opencode2api.log`. `stop.sh` sends SIGTERM, waits up to 20 seconds, then sends SIGKILL. Override defaults with `BINARY`, `VERSION`, `RELEASE`, `CONFIG_PATH`, `STATE_DIR`, `PID_FILE`, `LOG_FILE`, and `STOP_TIMEOUT`; each script supports `--help`.
+
 The example listens on `127.0.0.1:8080` for the API and `0.0.0.0:8081` for the WebUI. Open `http://localhost:8081` locally. Restrict management access and use an HTTPS reverse proxy when accessing it over a network.
 
 Command-line options:
@@ -211,11 +223,13 @@ Eligibility is a routing decision; the upstream can still reject or rate-limit t
 
 The routing sequence is:
 
-1. For an eligible model, try each available anonymous proxy once.
+1. For an eligible model, try each available anonymous proxy once. On a 403, rotate to a fresh constructed session and `msg_` request ID, prefer the next exit, and retry at most twice before falling back. A session retry reuses the last exit only when no untried exit remains.
 2. Try authenticated tiers in `prefer` order, using only tiers with a configured key and a route for that model.
 3. Apply `retry.max_attempts` separately to each authenticated tier.
 
 Anonymous attempts are not cut short by `retry.max_attempts`, but all attempts share the request timeout. Network errors, authentication failures, rate limits, and server errors can rotate keys. Other 4xx responses end the current tier; another available tier may still be tried.
+
+The anonymous lane is not just a set of copied headers: the v1 lane (`/zen`) and v2 lane (`/inference`) use their own header sets and tool shapes, and requests go through `httpx.BunTransport` to reproduce Bun's TLS ClientHello and HTTP/1.1 header order. The gateway constructs `ses_…` sessions itself and rotates them only after a 403. A 429 changes the exit or backs off; it does not silently switch models. `403` outcomes and `session_retries` appear in the request log; the upstream attempt summary and diagnostics page break 403/429 counts down by model and exit.
 
 Requests are encoded for each tier's own protocol. With `performance.first_event_timeout_seconds` enabled, a successful SSE response is held until the first complete data event. A timeout or disconnect before that event uses the existing key/proxy retry budget; comments do not satisfy the timeout. Once released downstream, the stream is never replayed. The default is `0` (disabled); try `15` seconds for upstreams that accept requests but send no events. This bounds the first event, not the first text token, and does not apply to System One. Rotation aliases use their separate `rotation.first_output_seconds` timeout. A recognized stale Responses reasoning reference can trigger one repair pass; selected-key diagnostics never use that replay.
 
@@ -512,6 +526,7 @@ for f in webui/js/*.js webui/js/pages/*.js; do node --input-type=module --check 
 | Health remains `starting`            | Inspect catalog refresh logs and outbound connectivity; add protocol overrides if needed. |
 | No models are exposed                | Check configured tiers, anonymous eligibility, and native protocol support.               |
 | Requests return 502/504              | Inspect upstream attempts, credentials, proxies, and total/per-attempt timeouts.          |
+| Anonymous requests return 403        | Inspect `anonymous_session_rotated` / `anonymous_session_rejected` logs and `session_retries`; verify the v1/v2 lane, tool shape, and Bun TLS/HTTP fingerprint. |
 | HTTP 200 but generation failed       | Inspect the SSE error event and request outcome, not only HTTP status.                    |
 | Host edits have no effect in Docker  | The active file is in the state volume; import it again or use the WebUI.                 |
 | Container ports are unreachable      | Check listener addresses, published ports, and the active volume configuration.           |

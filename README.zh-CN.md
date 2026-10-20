@@ -45,6 +45,18 @@ go build -o opencode2api ./cmd/opencode2api
 
 Windows 下使用 `Copy-Item config.example.json config.json` 复制配置，执行 `go build -o opencode2api.exe ./cmd/opencode2api` 编译，再运行 `.\opencode2api.exe -config config.json`。
 
+### 辅助脚本
+
+在 Linux、macOS 或 WSL 下，仓库提供本地后台运行的封装脚本：
+
+```bash
+./build.sh
+./start.sh
+./stop.sh
+```
+
+`build.sh` 默认生成 `./opencode2api`，并尝试用 `git describe` 注入版本号；`start.sh` 读取 `config.json`，后台启动程序，PID 和日志写入 `.local/`；`stop.sh` 先发送 SIGTERM，最多等待 20 秒，再发送 SIGKILL。可用 `BINARY`、`VERSION`、`RELEASE`、`CONFIG_PATH`、`STATE_DIR`、`PID_FILE`、`LOG_FILE` 和 `STOP_TIMEOUT` 覆盖默认值；三个脚本均支持 `--help`。
+
 示例配置的 API 监听 `127.0.0.1:8080`，WebUI 监听 `0.0.0.0:8081`。本机可访问 `http://localhost:8081`。通过网络访问管理界面时，请限制访问范围，并使用 HTTPS 反向代理。
 
 命令行参数：
@@ -211,11 +223,13 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 路由顺序：
 
-1. 符合条件的模型先尝试匿名通道，每个可用代理最多一次。
+1. 符合条件的模型先尝试匿名通道，每个可用代理最多一次；匿名 lane 返回 403 时，轮换新构造会话、新 `msg_` 请求 ID，并优先换下一个出口，最多重试 2 次。只有没有未尝试出口时，会话重试才会复用最后出口。
 2. 按 `prefer` 顺序尝试认证通道，仅包含已配置 Key 且可以提供该模型的 Tier。
 3. 每个认证 Tier 分别使用 `retry.max_attempts` 预算。
 
 匿名阶段不受 `retry.max_attempts` 截断，但所有阶段共享请求总超时。网络错误、认证失败、限流和服务端错误可以触发 Key 轮换；其他 4xx 会结束当前 Tier，仍可继续尝试另一个可用 Tier。
+
+匿名请求不是只复制 HTTP 头：v1 lane（`/zen`）和 v2 lane（`/inference`）使用各自的头集与工具形状，并通过 `httpx.BunTransport` 复刻 Bun 的 TLS ClientHello 和 HTTP/1.1 头顺序。网关自行构造 `ses_…` 会话；只有在 403 时才会轮换它。429 默认只换出口或退避，不会静默改模型；需要换模型时由客户端显式决定。`403` 结果与 `session_retries` 会出现在请求日志中；上游尝试统计和诊断页会按模型、出口拆分 403/429 计数。
 
 每个 Tier 使用自己的原生协议编码请求。启用 `performance.first_event_timeout_seconds` 后，会先等待完整的 SSE data 事件再向客户端交付响应；注释心跳不算首事件。首事件前超时或断开会沿用现有 Key / 代理重试预算，交付后不再重放。默认 `0` 关闭，可对接受请求后无事件的上游尝试设置为 `15` 秒。它限制首事件而非首个文本 token，不适用于 System One；轮转别名使用独立的 `rotation.first_output_seconds`。识别到过期的 Responses reasoning 引用时，可执行一次修复重试；指定 Key 的诊断不会执行该重试。
 
@@ -507,6 +521,7 @@ for f in webui/js/*.js webui/js/pages/*.js; do node --input-type=module --check 
 | 健康检查一直为 `starting`     | 查看目录刷新日志和网络连通性，必要时补充协议覆盖。 |
 | 模型列表为空                  | 检查配置的 Tier、匿名资格和原生协议是否受支持。    |
 | 请求返回 502 / 504            | 查看上游尝试、凭据、代理以及请求总超时和单次超时。 |
+| 匿名请求返回 403              | 查看 `anonymous_session_rotated` / `anonymous_session_rejected` 日志与 `session_retries`；确认 v1/v2 lane、工具形状和 Bun TLS/HTTP 指纹未被改动。 |
 | HTTP 200 但生成失败           | 查看 SSE 错误事件和请求结果，不能只看 HTTP 状态。  |
 | Docker 中宿主机配置修改不生效 | 当前配置在状态卷中；重新导入，或通过 WebUI 修改。  |
 | 无法通过容器端口访问          | 检查监听地址、端口映射和状态卷中的实际配置。       |

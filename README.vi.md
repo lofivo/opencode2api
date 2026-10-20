@@ -47,6 +47,18 @@ Trước khi khởi động, hãy sửa `config.json`:
 
 Trên Windows, dùng `Copy-Item config.example.json config.json`, build bằng `go build -o opencode2api.exe ./cmd/opencode2api`, rồi chạy `.\opencode2api.exe -config config.json`.
 
+### Script hỗ trợ
+
+Trên Linux, macOS hoặc WSL, repo có sẵn script chạy nền cục bộ:
+
+```bash
+./build.sh
+./start.sh
+./stop.sh
+```
+
+`build.sh` tạo `./opencode2api` và cố gắng nhúng phiên bản từ `git describe`; `start.sh` đọc `config.json`, chạy nền và ghi PID/log vào `.local/`; `stop.sh` gửi SIGTERM, chờ tối đa 20 giây rồi gửi SIGKILL. Có thể ghi đè bằng `BINARY`, `VERSION`, `RELEASE`, `CONFIG_PATH`, `STATE_DIR`, `PID_FILE`, `LOG_FILE` và `STOP_TIMEOUT`; cả ba script đều hỗ trợ `--help`.
+
 File mẫu lắng nghe `127.0.0.1:8080` cho API và `0.0.0.0:8081` cho WebUI. Mở `http://localhost:8081` ở máy cục bộ. Hãy giới hạn quyền truy cập quản trị và dùng reverse proxy HTTPS khi truy cập qua mạng.
 
 Tuỳ chọn dòng lệnh:
@@ -215,11 +227,13 @@ Khi `anonymous: true`, chỉ cần một trong hai điều kiện sau là mô h�
 
 Trình tự định tuyến là:
 
-1. Với mô hình đủ điều kiện, thử lần lượt mỗi proxy ẩn danh khả dụng.
+1. Với mô hình đủ điều kiện, thử lần lượt mỗi proxy ẩn danh khả dụng. Khi gặp 403, tạo session và `msg_` mới, ưu tiên đầu ra kế tiếp và thử lại tối đa hai lần trước khi dự phòng. Lần thử lại chỉ dùng lại đầu ra cuối khi không còn đầu ra chưa thử.
 2. Thử các tier có xác thực theo thứ tự `prefer`, chỉ dùng những tier có key được cấu hình và có route cho mô hình đó.
 3. Áp dụng `retry.max_attempts` riêng cho từng tier có xác thực.
 
 Các lần thử ẩn danh không bị `retry.max_attempts` cắt ngắn, nhưng mọi lần thử đều dùng chung timeout của request. Lỗi mạng, xác thực thất bại, giới hạn tần suất và lỗi máy chủ có thể làm luân chuyển key. Các phản hồi 4xx khác kết thúc tier hiện tại; một tier khác còn khả dụng vẫn có thể được thử.
+
+Làn ẩn danh không chỉ là sao chép header: làn v1 (`/zen`) và v2 (`/inference`) dùng bộ header và hình dạng tool riêng, và request đi qua `httpx.BunTransport` để tái tạo TLS ClientHello cùng thứ tự header HTTP/1.1 của Bun. Gateway tự tạo session `ses_…` và chỉ luân chuyển sau 403. Với 429, gateway đổi đầu ra hoặc backoff, không tự đổi mô hình. Kết quả 403 và `session_retries` xuất hiện trong log request; thống kê thử upstream và trang chẩn đoán chia số lần 403/429 theo mô hình và đầu ra.
 
 Request được mã hoá theo giao thức riêng của từng tier. Khi bật `performance.first_event_timeout_seconds`, một phản hồi SSE thành công sẽ được giữ lại cho tới sự kiện dữ liệu hoàn chỉnh đầu tiên. Timeout hoặc mất kết nối trước sự kiện đó sẽ dùng ngân sách retry key/proxy hiện có; comment không tính là thoát timeout. Sau khi được giải phóng xuống phía dưới, luồng không bao giờ được phát lại. Mặc định là `0` (tắt); hãy thử `15` giây cho các upstream nhận request nhưng không gửi sự kiện nào. Giới hạn này áp dụng cho sự kiện đầu tiên, không phải token văn bản đầu tiên, và không áp dụng cho System One. Bí danh luân chuyển dùng timeout riêng `rotation.first_output_seconds`. Một tham chiếu reasoning Responses bị lỗi thời đã nhận diện có thể kích hoạt một lượt sửa; chẩn đoán chọn key cụ thể không bao giờ dùng lượt phát lại đó.
 
@@ -502,6 +516,7 @@ for f in webui/js/*.js webui/js/pages/*.js; do node --input-type=module --check 
 | Health vẫn là `starting`                   | Xem log làm mới danh mục và kết nối đi ra; thêm ghi đè giao thức nếu cần.            |
 | Không có mô hình nào được công khai          | Kiểm tra tier đã cấu hình, điều kiện ẩn danh và hỗ trợ giao thức gốc.               |
 | Request trả 502/504                         | Xem các lần thử upstream, credential, proxy và timeout tổng/theo từng lần thử.       |
+| Request ẩn danh trả 403                     | Xem log `anonymous_session_rotated` / `anonymous_session_rejected` và `session_retries`; kiểm tra làn v1/v2, hình dạng tool và dấu vân tay TLS/HTTP của Bun. |
 | HTTP 200 nhưng sinh nội dung thất bại        | Xem sự kiện lỗi SSE và kết quả request, không chỉ mã trạng thái HTTP.                |
 | Sửa trên host không có tác dụng trong Docker | File đang hoạt động nằm trong volume trạng thái; import lại hoặc dùng WebUI.        |
 | Không kết nối được cổng của container       | Kiểm tra địa chỉ lắng nghe, cổng đã publish và cấu hình trong volume đang dùng.    |
