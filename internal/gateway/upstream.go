@@ -257,6 +257,14 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 	if !route.Anonymous && len(keyTiers) == 0 && (route.Tier == config.TierZen || route.Tier == config.TierGo) {
 		keyTiers = []config.Tier{route.Tier}
 	}
+	if route.Anonymous && len(keyTiers) > 0 {
+		// Key tiers use the identity derived from the client request, not the
+		// anonymous lane's rotated session. Keep session_retries as a record of
+		// the anonymous phase, but report the session the key attempt uses.
+		if meta := telemetry.MetaFromContext(ctx); meta != nil {
+			meta.Session = ids.Session
+		}
+	}
 	for _, tier := range keyTiers {
 		keyRoute := route
 		keyRoute.Tier = tier
@@ -291,16 +299,24 @@ func (g *Gateway) doUpstreamTiers(ctx context.Context, route models.Route, bodie
 }
 
 // doAnonymousUpstream walks the session's anonymous proxy cursor. Each static
-// proxy is tried at most once; rotating #pool proxies may be drawn again until
-// Retry.MaxAttempts proxies were used. For each proxy it tries the upstreams in
-// anonymousUpstreams order: the v1 lane (models.V1Base) before the v2
-// /inference upstream (Upstream.Anonymous). Any failure, including an HTTP
+// proxy is drawn at most once from the cursor; rotating #pool proxies may be
+// drawn again until Retry.MaxAttempts proxies were used, and a session retry
+// may reuse the last exit when the cursor is exhausted. For each proxy it
+// tries the upstreams in anonymousUpstreams order: the v1 lane (models.V1Base)
+// before the v2 /inference upstream (Upstream.Anonymous). Any failure,
+// including an HTTP
 // error response, advances to the next upstream or proxy; a proxy-route
 // failure, or a proxy marked unhealthy, skips that proxy's remaining
-// upstreams. Only a successful response ends the anonymous phase; exhausting
-// the proxy cursor returns control to the preferred authenticated tiers. It
-// returns the last response (body still open), else the last error, plus the
-// number of attempts made.
+// upstreams.
+//
+// A 403 from the free tier is treated as a rejected upstream identity rather
+// than a bad exit: the gateway mints a fresh canonical session and message id
+// and retries, preferring the next proxy when one is available, up to
+// maxAnonymousSessionRetries times. Rotated attempts do not cool the proxy. If
+// the last fresh identity is rejected too, the 403 is returned and
+// doUpstreamTiers falls back to the preferred authenticated tiers. Only a
+// successful response ends the anonymous phase. It returns the last response
+// (body still open), else the last error, plus the number of attempts made.
 func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, bodies map[config.Tier][]byte, ids identity.RequestIDs, attemptOffset int) (*http.Response, error, int) {
 	var lastResponse *http.Response
 	var lastErr error
@@ -311,6 +327,10 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	}
 	proxies := 0
 	attempts := 0
+	sessionRetries := 0
+	retryPending := false
+	retryIDs := ids
+	var lastNode *anonymousNode
 	rawBody := bodies[config.TierZen]
 	if len(rawBody) == 0 {
 		return nil, errors.New("no prepared Zen request body"), 0
@@ -328,7 +348,7 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 	for i, baseURL := range upstreams {
 		preparedBodies[i], toolAliases[i] = prepareAnonymousBody(rawBody, protocol, models.IsV1Upstream(baseURL))
 	}
-	for proxies < limit {
+	for proxies < limit || retryPending {
 		if ctx.Err() != nil {
 			// The request-level budget is already gone. Stop scanning instead
 			// of firing attempts that cannot succeed and then recording them
@@ -340,11 +360,21 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 		node := cursor.Next()
 		if node == nil {
-			break
+			if retryPending && lastNode != nil {
+				// There is no untried exit left. Retry the last one with the
+				// fresh identity: the 403 was session-specific, not IP-specific.
+				node = lastNode
+			} else {
+				break
+			}
+		} else {
+			proxies++
 		}
-		proxies++
+		retryPending = false
+		lastNode = node
 		var nodeResp *http.Response
 		var nodeErr error
+		lastBaseURL := upstreams[0]
 		for index, baseURL := range upstreams {
 			if ctx.Err() != nil {
 				if lastErr == nil && lastResponse == nil {
@@ -353,17 +383,18 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				break
 			}
 			setRequestShape(ctx, false, toolAliases[index])
-			if meta := telemetry.MetaFromContext(ctx); meta != nil {
-				meta.Attempts = attemptOffset + attempts
-				meta.Tier = string(config.TierZen)
-			}
 			if lastResponse != nil {
 				httpx.DrainAndClose(lastResponse.Body)
 				lastResponse = nil
 			}
-			req, err := upstreamRequest(ctx, baseURL, protocol, preparedBodies[index], ids, anonymousZenKey)
+			req, err := upstreamRequest(ctx, baseURL, protocol, preparedBodies[index], retryIDs, anonymousZenKey)
 			if err != nil {
 				return nil, err, attempts
+			}
+			attempts++
+			if meta := telemetry.MetaFromContext(ctx); meta != nil {
+				meta.Attempts = attemptOffset + attempts
+				meta.Tier = string(config.TierZen)
 			}
 			if node.proxy.pool {
 				req.Close = true
@@ -383,27 +414,49 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 				break
 			}
 			nodeResp, nodeErr = resp, err
-			g.recordUpstreamAttempt(ctx, route, ids, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
+			lastBaseURL = baseURL
+			g.recordUpstreamAttempt(ctx, route, retryIDs, attemptOffset+attempts, "anonymous", "anonymous", true, node.proxy, resp, err, duration)
 			if err == nil && resp.StatusCode/100 == 2 {
 				g.observeAnonymousResult(ctx, node, resp, nil)
-				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				g.logger.Debug("anonymous upstream accepted request", "component", "upstream", "event", "anonymous_attempt_succeeded", "request_id", ids.Request, "attempt", attempts, "session_retries", sessionRetries, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 				return resp, nil, attempts
 			}
 			lastResponse = resp
 			lastErr = asProxyUnavailable(node.proxy, err)
 			if err != nil {
-				g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
+				g.logger.Debug("anonymous transport attempt failed", "component", "upstream", "event", "anonymous_attempt_transport_failed", "request_id", ids.Request, "attempt", attempts, "session_retries", sessionRetries, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "duration_ms", duration.Milliseconds(), "error", err)
 				if isProxyFailure(err) {
 					break
 				}
 			} else {
-				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
+				g.logger.Debug("anonymous upstream returned an error response; trying the next upstream or proxy", "component", "upstream", "event", "anonymous_attempt_response_failed", "request_id", ids.Request, "attempt", attempts, "session_retries", sessionRetries, "tier", config.TierZen, "upstream", config.RedactURL(baseURL), "key_id", "anonymous", "channel", "anonymous", "anonymous", true, "proxy", config.RedactURL(node.proxy.name), "status", resp.StatusCode, "duration_ms", duration.Milliseconds())
 			}
 			if index+1 < len(upstreams) && !node.proxy.healthy.Load() {
 				break
 			}
 		}
 		if ctx.Err() != nil {
+			break
+		}
+		if nodeResp != nil && nodeErr == nil && nodeResp.StatusCode == http.StatusForbidden {
+			snippet := g.anonymousRejectionSnippet(nodeResp)
+			if sessionRetries < maxAnonymousSessionRetries {
+				retryIDs = identity.RotateSession(retryIDs)
+				sessionRetries++
+				retryPending = true
+				if meta := telemetry.MetaFromContext(ctx); meta != nil {
+					meta.Session = retryIDs.Session
+					meta.SessionRetries = sessionRetries
+				}
+				g.logger.Info("anonymous session rejected; rotating identity and retrying", "component", "upstream", "event", "anonymous_session_rotated", "request_id", ids.Request, "attempt", attempts, "session_retries", sessionRetries, "tier", config.TierZen, "upstream", config.RedactURL(lastBaseURL), "proxy", config.RedactURL(node.proxy.name), "status", nodeResp.StatusCode, "snippet", snippet)
+				continue
+			}
+			message := "anonymous session rejected after retries"
+			if len(route.KeyTiers) > 0 {
+				message += "; falling back to key tiers"
+			}
+			g.logger.Warn(message, "component", "upstream", "event", "anonymous_session_rejected", "request_id", ids.Request, "attempt", attempts, "session_retries", sessionRetries, "tier", config.TierZen, "upstream", config.RedactURL(lastBaseURL), "proxy", config.RedactURL(node.proxy.name), "status", nodeResp.StatusCode, "snippet", snippet)
+			g.observeAnonymousResult(ctx, node, nodeResp, nodeErr)
 			break
 		}
 		g.observeAnonymousResult(ctx, node, nodeResp, nodeErr)
@@ -418,6 +471,35 @@ func (g *Gateway) doAnonymousUpstream(ctx context.Context, route models.Route, b
 		}
 	}
 	return nil, lastErr, attempts
+}
+
+// maxAnonymousSessionRetries bounds how many fresh identities one anonymous
+// request may try after 403 FreeTierError before it falls back to the key
+// tiers. A retry rotates the session and, when another exit is available, the
+// proxy too.
+const maxAnonymousSessionRetries = 2
+
+// anonymousRejectionSnippet returns a capped, redacted snippet of a small error
+// body and restores the body for the caller. It is used on 403 responses so the
+// session gate's message is visible in the event log without consuming the body
+// returned to the downstream client.
+func (g *Gateway) anonymousRejectionSnippet(resp *http.Response) string {
+	if resp == nil || resp.Body == nil {
+		return ""
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 64<<10))
+	httpx.DrainAndClose(resp.Body)
+	resp.Body = io.NopCloser(bytes.NewReader(body))
+	if err != nil && len(body) == 0 {
+		return ""
+	}
+	redactor := config.SecretRedactor()
+	redactor.Replace(g.cfg)
+	snippet := strings.TrimSpace(redactor.String(string(body)))
+	if len(snippet) > 240 {
+		snippet = snippet[:240]
+	}
+	return snippet
 }
 
 // anonymousUpstreams returns the ordered base URLs for the keyless free tier:

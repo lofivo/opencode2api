@@ -17,6 +17,7 @@ import (
 	"math/big"
 	"net/http"
 	"regexp"
+	"time"
 
 	"opencode2api/internal/jsonutil"
 )
@@ -33,6 +34,19 @@ type RequestIDs struct {
 	Message       string
 	Project       string
 	ParentSession string
+}
+
+// RotateSession returns ids with a freshly minted canonical session and user
+// message id, keeping the local request id, project and parent session. The
+// anonymous free tier can reject a previously accepted session with 403
+// FreeTierError once its upstream state expires; retrying with the same
+// identity only repeats that rejection, so the gateway rotates the upstream
+// identity before its next attempt. A new message id is minted per attempt
+// because the v1 lane sends it as x-opencode-request.
+func RotateSession(ids RequestIDs) RequestIDs {
+	ids.Session = CanonicalSessionID(RandomID("retry", 16))
+	ids.Message = AscendingID("msg", time.Now())
+	return ids
 }
 
 // DeriveRequestIDs derives the upstream identity of one request. scope names

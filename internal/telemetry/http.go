@@ -20,20 +20,23 @@ type RequestMeta struct {
 	Tier       string
 	Protocol   protocol.Protocol
 	Request    string
-	// Session is the canonical upstream session (ses_...). All turns of one
-	// conversation share it, so per-session token burn is visible in logs
-	// and monitoring: every session draws from the same upstream IP bucket
-	// on the anonymous lane.
+	// Session is the canonical upstream session (ses_...) of the final attempt.
+	// All turns of one conversation normally share it, so per-session token
+	// burn is visible in logs and monitoring: every session draws from the same
+	// upstream IP bucket on the anonymous lane. A 403 retry rotates it.
 	Session   string
 	KeyID     string
 	Channel   string
 	Anonymous bool
 	Proxy     string
 	Attempts  int
-	Legs      []string
-	Stop      string
-	Tail      string
-	Stream    bool
+	// SessionRetries counts anonymous attempts retried with a freshly minted
+	// upstream session after a 403 FreeTierError.
+	SessionRetries int
+	Legs           []string
+	Stop           string
+	Tail           string
+	Stream         bool
 	// ServerKeyID is the fingerprint of the local server key the caller
 	// authenticated with, so usage can be split per caller. KeyID is the
 	// upstream account that served the request.
@@ -144,13 +147,13 @@ func Middleware(monitor *Metrics, logger *slog.Logger, next http.Handler) http.H
 				logger.Info("request routed", "component", "http", "event", "request_routed", "method", r.Method,
 					"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "request_id", meta.Request,
 					"model", meta.Model, "model_alias", meta.ModelAlias, "session", meta.Session, "server_key_id", meta.ServerKeyID, "tier", meta.Tier, "key_id", meta.KeyID,
-					"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "legs", strings.Join(meta.Legs, " "), "stream", meta.Stream, "outcome", outcome,
+					"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "session_retries", meta.SessionRetries, "legs", strings.Join(meta.Legs, " "), "stream", meta.Stream, "outcome", outcome,
 					"stop", meta.Stop, "in", meta.Usage.Input, "out", meta.Usage.Output, "reasoning_tokens", meta.Usage.Reasoning, "cached", meta.Usage.Cached, "tail", meta.Tail)
 			}
 			logger.Debug("request completed", "component", "http", "event", "request_complete", "method", r.Method,
 				"path", r.URL.Path, "status", status, "duration_ms", duration.Milliseconds(), "bytes", writer.bytes,
 				"request_id", meta.Request, "model", meta.Model, "model_alias", meta.ModelAlias, "tier", meta.Tier, "key_id", meta.KeyID,
-				"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "stream", meta.Stream, "outcome", outcome)
+				"channel", meta.Channel, "anonymous", meta.Anonymous, "attempts", meta.Attempts, "session_retries", meta.SessionRetries, "stream", meta.Stream, "outcome", outcome)
 		}()
 		next.ServeHTTP(writer, r)
 	})
