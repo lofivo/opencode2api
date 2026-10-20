@@ -223,8 +223,8 @@ System One 将自由文本状态与类型化问题配对，并返回类型化答
 
 路由顺序：
 
-1. 符合条件的模型先尝试匿名通道，每个可用代理最多一次；匿名 lane 返回 403 时，轮换新构造会话、新 `msg_` 请求 ID，并优先换下一个出口，最多重试 2 次。只有没有未尝试出口时，会话重试才会复用最后出口。
-2. 按 `prefer` 顺序尝试认证通道，仅包含已配置 Key 且可以提供该模型的 Tier。
+1. 符合条件的模型先尝试匿名通道，在每个出口优先使用 v2 `/inference`，失败后回退到 v1 `/zen`。仍返回 403 时，同时轮换主会话、已有父/子会话及 `msg_` 请求 ID，并优先换下一个出口，最多重试 2 次。只有没有未尝试出口时，会话重试才会复用最后出口。
+2. 按 `prefer` 顺序尝试认证通道，仅包含已配置 Key 且可以提供该模型的 Tier；使用从客户端请求派生的原始身份，不沿用匿名阶段轮换后的身份。
 3. 每个认证 Tier 分别使用 `retry.max_attempts` 预算。
 
 匿名阶段不受 `retry.max_attempts` 截断，但所有阶段共享请求总超时。网络错误、认证失败、限流和服务端错误可以触发 Key 轮换；其他 4xx 会结束当前 Tier，仍可继续尝试另一个可用 Tier。
@@ -276,7 +276,7 @@ Key 初始化时均衡分配到代理。真实流量可以触发代理检查、K
 | `prefer`                    | `go`；可选 `go`、`zen`。                                                              |
 | `upstream.zen`              | `https://opencode.ai/zen`。                                                           |
 | `upstream.go`               | `https://opencode.ai/zen/go`。                                                        |
-| `upstream.anonymous`        | `https://opencode.ai/inference`；匿名通道在 `/zen` 之后的回退上游。                   |
+| `upstream.anonymous`        | `https://opencode.ai/inference`；匿名通道优先使用，失败后回退到 `/zen`。             |
 | `proxies`                   | 两个代理来源都为空时，使用 `["direct"]`。                                             |
 | `proxyfile`                 | 可选；相对路径基于配置文件所在目录解析。                                              |
 | `models.refresh_seconds`    | `300`；最小为 1。                                                                     |

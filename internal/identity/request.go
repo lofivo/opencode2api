@@ -5,7 +5,8 @@
 // carry the v1 lane's x-opencode-request header. The identity that matters
 // upstream is therefore the pair (x-opencode-session, x-opencode-session-id):
 // Session is the conversation-affinity key and must keep the descending layout
-// minted by CanonicalSessionID.
+// minted by CanonicalSessionID; ChildSession preserves the client's own
+// x-opencode-session-id when it differs, as it does for a subagent.
 package identity
 
 import (
@@ -23,13 +24,16 @@ import (
 )
 
 // RequestIDs carries the identity headers the upstream free tier inspects.
-// Session is sent as both x-opencode-session and x-opencode-session-id.
-// Message is the user message id the v1 lane receives as x-opencode-request;
-// the v2 lane rejects that header. Request only identifies the request inside
-// the gateway. Project is rendered per lane by the gateway (prj_* on the v1
-// lane, bare 40-hex on the v2 lane).
+// Session is the conversation-affinity key sent as x-opencode-session; the
+// v2 lane sends ChildSession, the client's own x-opencode-session-id, as
+// x-opencode-session-id so a subagent keeps its child id while affinity stays
+// on the parent. The v1 lane sends Session as both headers. Message is the
+// user message id the v1 lane receives as x-opencode-request; the v2 lane
+// rejects that header. Request only identifies the request inside the
+// gateway. Project is rendered per lane by the gateway.
 type RequestIDs struct {
 	Session       string
+	ChildSession  string
 	Request       string
 	Message       string
 	Project       string
@@ -37,14 +41,31 @@ type RequestIDs struct {
 }
 
 // RotateSession returns ids with a freshly minted canonical session and user
-// message id, keeping the local request id, project and parent session. The
+// message id, keeping the local request id and project. Parent and child
+// sessions rotate too: the v2 lane uses them instead of Session when present.
+// Equal session fields stay equal, preserving their affinity relationship. The
 // anonymous free tier can reject a previously accepted session with 403
 // FreeTierError once its upstream state expires; retrying with the same
 // identity only repeats that rejection, so the gateway rotates the upstream
 // identity before its next attempt. A new message id is minted per attempt
 // because the v1 lane sends it as x-opencode-request.
 func RotateSession(ids RequestIDs) RequestIDs {
-	ids.Session = CanonicalSessionID(RandomID("retry", 16))
+	sessions := make(map[string]string, 3)
+	rotate := func(previous string) string {
+		if session, ok := sessions[previous]; ok {
+			return session
+		}
+		session := CanonicalSessionID(RandomID("retry", 16))
+		sessions[previous] = session
+		return session
+	}
+	ids.Session = rotate(ids.Session)
+	if ids.ChildSession != "" {
+		ids.ChildSession = rotate(ids.ChildSession)
+	}
+	if ids.ParentSession != "" {
+		ids.ParentSession = rotate(ids.ParentSession)
+	}
 	ids.Message = AscendingID("msg", time.Now())
 	return ids
 }
@@ -82,6 +103,10 @@ func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) Reques
 		signal = RandomID("fallback", 16)
 	}
 	session := scopedSessionID(scope, signal)
+	childSession := r.Header.Get("x-opencode-session-id")
+	if childSession != "" {
+		childSession = scopedSessionID(scope, childSession)
+	}
 	projectSignal := jsonutil.FirstString(r.Header.Get("x-opencode-project"), jsonutil.StringAt(body, "metadata", "project_id"))
 	if projectSignal == "" {
 		// Without a client project every caller would otherwise share one
@@ -92,11 +117,16 @@ func DeriveRequestIDs(r *http.Request, body map[string]any, scope string) Reques
 		}
 	}
 	parentSession := jsonutil.FirstString(
+		r.Header.Get("x-opencode-parent-session-id"),
 		r.Header.Get("x-parent-session-id"),
 		jsonutil.StringAt(body, "metadata", "parent_session_id"),
 	)
+	if parentSession != "" {
+		parentSession = scopedSessionID(scope, parentSession)
+	}
 	return RequestIDs{
 		Session:       session,
+		ChildSession:  childSession,
 		Request:       RandomID("req", 16),
 		Message:       UserMessageID(r, body, session),
 		Project:       projectSignal,

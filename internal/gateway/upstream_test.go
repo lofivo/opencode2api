@@ -172,16 +172,21 @@ func TestSetV1Headers(t *testing.T) {
 
 func TestSetV2Headers(t *testing.T) {
 	const session = "ses_eb5907d57ffe6OjPD1n2KSIRdM"
+	const child = "ses_eb5907d57ffeChildSession01"
 	ids := identity.RequestIDs{
 		Session: session, Message: "msg_eb5907d57ffe6OjPD1n2KSIRdM",
-		Project: "conversation", ParentSession: "ses_eb5b07785ffeBUGIG4j0rMvFM8",
+		ChildSession: child,
+		Project:      "conversation", ParentSession: "ses_eb5b07785ffeBUGIG4j0rMvFM8",
 	}
 	header := http.Header{}
 	setV2Headers(header, wire.Chat, ids)
-	for _, name := range []string{"x-opencode-session", "x-opencode-session-id", "x-session-affinity", "X-Session-Id"} {
-		if got := header.Get(name); got != session {
-			t.Fatalf("%s = %q, want %q", name, got, session)
+	for _, name := range []string{"x-opencode-session", "x-session-affinity", "X-Session-Id"} {
+		if got := header.Get(name); got != ids.ParentSession {
+			t.Fatalf("%s = %q, want parent %q", name, got, ids.ParentSession)
 		}
+	}
+	if got := header.Get("x-opencode-session-id"); got != child {
+		t.Fatalf("x-opencode-session-id = %q, want child %q", got, child)
 	}
 	if got := header.Get("x-opencode-request"); got != "" {
 		t.Fatalf("v2 headers must not send x-opencode-request, got %q", got)
@@ -192,8 +197,8 @@ func TestSetV2Headers(t *testing.T) {
 	if got := header.Get("x-parent-session-id"); got != ids.ParentSession {
 		t.Fatalf("x-parent-session-id = %q", got)
 	}
-	if got := header.Get("x-opencode-parent-session-id"); got != "" {
-		t.Fatalf("v2 headers must not send x-opencode-parent-session-id, got %q", got)
+	if got := header.Get("x-opencode-parent-session-id"); got != ids.ParentSession {
+		t.Fatalf("x-opencode-parent-session-id = %q, want %q", got, ids.ParentSession)
 	}
 	if ua := header.Get("User-Agent"); ua != "opencode/latest/2.0.32/cli" {
 		t.Fatalf("v2 User-Agent = %q", ua)
@@ -204,18 +209,18 @@ func TestSetV2Headers(t *testing.T) {
 }
 
 func TestProjectIDShapes(t *testing.T) {
-	if got := v1ProjectID("global"); got != "global" {
-		t.Fatalf("v1ProjectID(global) = %q", got)
+	if got := projectID("global"); got != "global" {
+		t.Fatalf("projectID(global) = %q", got)
 	}
 	const commit = "0123456789abcdef0123456789abcdef01234567"
-	if got := v1ProjectID(commit); got != commit {
-		t.Fatalf("v1ProjectID(commit) = %q, want the commit unchanged", got)
+	if got := projectID(commit); got != commit {
+		t.Fatalf("projectID(commit) = %q, want the commit unchanged", got)
 	}
-	if got := v1ProjectID("some conversation"); !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(got) {
-		t.Fatalf("v1ProjectID(other) = %q, want 40 lowercase hex characters", got)
+	if got := projectID("some conversation"); !regexp.MustCompile(`^[0-9a-f]{40}$`).MatchString(got) {
+		t.Fatalf("projectID(other) = %q, want 40 lowercase hex characters", got)
 	}
-	if first, second := v2ProjectID("project"), v2ProjectID("project"); first != second {
-		t.Fatalf("v2ProjectID is not deterministic: %q != %q", first, second)
+	if first, second := projectID("project"), projectID("project"); first != second {
+		t.Fatalf("projectID is not deterministic: %q != %q", first, second)
 	}
 }
 
@@ -264,7 +269,7 @@ func TestAnonymous403RetrySucceedsWithFreshSession(t *testing.T) {
 	}
 	defer resp.Body.Close()
 	if attempts != 3 {
-		t.Fatalf("attempts = %d, want 3 (two rejected lanes + one recovered v1 attempt)", attempts)
+		t.Fatalf("attempts = %d, want 3 (two rejected lanes + one recovered v2 attempt)", attempts)
 	}
 	if len(sessions) != 3 {
 		t.Fatalf("fake transport saw %d attempts, want 3", len(sessions))
@@ -350,12 +355,12 @@ func TestAnonymous403RotatesSessionAndStopsAfterTwoRetries(t *testing.T) {
 	}
 
 	for round := 0; round < 3; round++ {
-		v1, v2 := seen[round*2], seen[round*2+1]
-		if !strings.HasSuffix(v1.path, "/zen/v1/chat/completions") {
-			t.Fatalf("round %d first path = %q", round, v1.path)
-		}
+		v2, v1 := seen[round*2], seen[round*2+1]
 		if !strings.HasSuffix(v2.path, "/inference/v1/chat/completions") {
-			t.Fatalf("round %d second path = %q", round, v2.path)
+			t.Fatalf("round %d first path = %q", round, v2.path)
+		}
+		if !strings.HasSuffix(v1.path, "/zen/v1/chat/completions") {
+			t.Fatalf("round %d second path = %q", round, v1.path)
 		}
 		if v1.session != v2.session {
 			t.Fatalf("round %d lanes used different sessions: %q != %q", round, v1.session, v2.session)
@@ -369,8 +374,205 @@ func TestAnonymous403RotatesSessionAndStopsAfterTwoRetries(t *testing.T) {
 		if round > 0 && v1.session == seen[(round-1)*2].session {
 			t.Fatalf("round %d reused the rejected session %q", round, v1.session)
 		}
-		if round > 0 && v1.message == seen[(round-1)*2].message {
+		if round > 0 && v1.message == seen[(round-1)*2+1].message {
 			t.Fatalf("round %d reused the rejected message id %q", round, v1.message)
 		}
+	}
+}
+
+func TestAnonymousSubsessionRecoveryAndKeyFallback(t *testing.T) {
+	for _, tc := range []struct {
+		fallback       bool
+		sessionIsChild bool
+	}{{}, {fallback: true}, {sessionIsChild: true}, {fallback: true, sessionIsChild: true}} {
+		fallback := tc.fallback
+		name := "recover anonymously"
+		if fallback {
+			name = "fall back to key with original identity"
+		}
+		if tc.sessionIsChild {
+			name += "/session points to child"
+		}
+		t.Run(name, func(t *testing.T) {
+			ids := identity.RequestIDs{
+				Session:       identity.CanonicalSessionID("parent"),
+				ParentSession: identity.CanonicalSessionID("parent"),
+				ChildSession:  identity.CanonicalSessionID("child"),
+				Request:       "req_subsession",
+				Project:       "global",
+			}
+			if tc.sessionIsChild {
+				ids.Session = ids.ChildSession
+			}
+			var seen []*http.Request
+			fake := roundTripFunc(func(req *http.Request) (*http.Response, error) {
+				seen = append(seen, req)
+				anonymous := req.Header.Get("Authorization") == "Bearer public"
+				status := http.StatusOK
+				if anonymous && (fallback || len(seen) <= 2) {
+					status = http.StatusForbidden
+				}
+				if meta := telemetry.MetaFromContext(req.Context()); meta.Session != req.Header.Get("x-opencode-session") {
+					t.Errorf("telemetry session %q differs from sent session %q", meta.Session, req.Header.Get("x-opencode-session"))
+				}
+				return &http.Response{
+					StatusCode: status, Header: http.Header{}, Request: req,
+					Body: io.NopCloser(strings.NewReader(`{"ok":true}`)),
+				}, nil
+			})
+			proxy := &proxyTransport{index: 0, name: "direct", client: &http.Client{Transport: fake}, bun: &http.Client{Transport: fake}}
+			proxy.healthy.Store(true)
+			transports := &proxyTransports{items: []*proxyTransport{proxy}}
+			keys, err := nodePool([]string{"test-key"}, transports, time.Minute)
+			if err != nil {
+				t.Fatal(err)
+			}
+			g := &Gateway{
+				cfg: config.Config{
+					Upstream: config.UpstreamConfig{Anonymous: "https://opencode.ai/inference", Go: "https://opencode.ai/zen/go"},
+					Retry:    config.RetryConfig{MaxAttempts: 1},
+				},
+				logger: slog.New(slog.NewTextHandler(io.Discard, nil)), transports: transports,
+				anonymous: anonymousPool(true, transports, time.Minute), goNodes: keys,
+				catalog: models.Catalog(config.TierZen, nil), monitor: telemetry.Monitor(),
+			}
+			route := models.Route{ID: "test-free", Tier: config.TierZen, Protocol: wire.Chat, Anonymous: true, KeyTiers: []config.Tier{config.TierGo}}
+			body := []byte(`{"model":"test-free","messages":[{"role":"user","content":"hi"}]}`)
+			ctx := telemetry.WithRequestMeta(context.Background(), &telemetry.RequestMeta{Request: ids.Request})
+			resp, effective, attempts, err := g.doUpstreamTiers(ctx, route, map[config.Tier][]byte{config.TierZen: body, config.TierGo: body}, ids, 0)
+			if err != nil || resp == nil || resp.StatusCode != http.StatusOK {
+				t.Fatalf("response=%v, err=%v", resp, err)
+			}
+			defer resp.Body.Close()
+			wantAttempts, wantRetries := 3, 1
+			if fallback {
+				wantAttempts, wantRetries = 7, 2
+			}
+			if attempts != wantAttempts || len(seen) != wantAttempts {
+				t.Fatalf("attempts=%d, seen=%d, want %d", attempts, len(seen), wantAttempts)
+			}
+			for round := 0; round <= wantRetries; round++ {
+				req := seen[round*2]
+				root := req.Header.Get("x-opencode-session")
+				child := req.Header.Get("x-opencode-session-id")
+				if req.URL.Path != "/inference/v1/chat/completions" {
+					t.Fatalf("round %d did not start on v2: %s", round, req.URL)
+				}
+				for _, header := range []string{"x-session-affinity", "X-Session-Id", "x-opencode-parent-session-id", "x-parent-session-id"} {
+					if got := req.Header.Get(header); got != root {
+						t.Fatalf("round %d %s=%q, want root %q", round, header, got, root)
+					}
+				}
+				if root == child {
+					t.Fatalf("round %d lost the distinct child session", round)
+				}
+				if round == 0 {
+					if root != ids.ParentSession || child != ids.ChildSession {
+						t.Fatal("initial request did not preserve client parent/child identity")
+					}
+				} else if previous := seen[(round-1)*2]; root == previous.Header.Get("x-opencode-session") || child == previous.Header.Get("x-opencode-session-id") {
+					t.Fatalf("round %d reused a rejected parent or child", round)
+				}
+			}
+			meta := telemetry.MetaFromContext(ctx)
+			last := seen[len(seen)-1]
+			if meta.SessionRetries != wantRetries || meta.Session != last.Header.Get("x-opencode-session") {
+				t.Fatalf("incorrect final session telemetry: %+v", meta)
+			}
+			if fallback {
+				if effective.Anonymous || effective.Tier != config.TierGo || last.Header.Get("Authorization") != "Bearer test-key" {
+					t.Fatal("request did not fall back to the configured key")
+				}
+				if last.Header.Get("x-opencode-session") != ids.ParentSession || last.Header.Get("x-opencode-session-id") != ids.ChildSession || last.Header.Get("x-opencode-parent-session-id") != ids.ParentSession {
+					t.Fatal("anonymous rotation leaked into the key tier's identity")
+				}
+			} else if !effective.Anonymous || !proxy.healthy.Load() {
+				t.Fatal("successful anonymous recovery changed the route or cooled its proxy")
+			}
+		})
+	}
+}
+
+func TestUpstreamRequestLaneShapes(t *testing.T) {
+	for _, base := range []string{models.V1Base, "https://opencode.ai/inference", "https://opencode.ai/zen/go"} {
+		for _, protocol := range []wire.Protocol{wire.Chat, wire.Responses, wire.Anthropic} {
+			t.Run(base+"/"+string(protocol), func(t *testing.T) {
+				req, err := upstreamRequest(context.Background(), base, protocol, []byte(`{}`), identity.RequestIDs{Session: identity.CanonicalSessionID("root"), Project: "global"}, "test-key")
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer req.Body.Close()
+				if req.URL.Path != strings.TrimPrefix(base, "https://opencode.ai")+wire.Path(protocol) {
+					t.Fatalf("unexpected endpoint %s", req.URL)
+				}
+				if req.Header.Get("x-opencode-project") != "global" {
+					t.Fatal("global project was hashed")
+				}
+				if req.Header.Get("x-opencode-session-id") != req.Header.Get("x-opencode-session") {
+					t.Fatal("request without a child did not use its root session")
+				}
+				wantBeta := ""
+				if protocol == wire.Anthropic {
+					if req.Header.Get("x-api-key") != "test-key" || req.Header.Get("anthropic-version") != "2023-06-01" || len(req.Header.Values("anthropic-version")) != 1 {
+						t.Fatalf("incorrect Anthropic authentication/version headers: %v", req.Header)
+					}
+					if !models.IsV1Upstream(base) {
+						wantBeta = "true"
+						if req.Header.Get("anthropic-beta") != "interleaved-thinking-2025-05-14" {
+							t.Fatal("v2 Anthropic beta set differs from the client")
+						}
+					}
+				} else if req.Header.Get("Authorization") != "Bearer test-key" || req.Header.Get("anthropic-version") != "" {
+					t.Fatal("non-Anthropic authentication/headers changed")
+				}
+				if got := req.URL.Query().Get("beta"); got != wantBeta {
+					t.Fatalf("beta=%q, want %q", got, wantBeta)
+				}
+			})
+		}
+	}
+}
+
+func TestPrepareAnonymousBodyV2NormalizesPatchTool(t *testing.T) {
+	for _, protocol := range []wire.Protocol{wire.Chat, wire.Responses, wire.Anthropic} {
+		t.Run(string(protocol), func(t *testing.T) {
+			tool := map[string]any{"name": "patch", "description": "outdated", "parameters": map[string]any{"type": "object"}}
+			if protocol == wire.Chat {
+				tool = map[string]any{"type": "function", "function": tool}
+			} else if protocol == wire.Anthropic {
+				tool["input_schema"] = tool["parameters"]
+				delete(tool, "parameters")
+			}
+			body, err := json.Marshal(map[string]any{"model": "m", "tools": []any{tool}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			prepared, _ := prepareAnonymousBody(body, protocol, false)
+			tools, _ := decodeBody(t, prepared)["tools"].([]any)
+			var patch map[string]any
+			count := 0
+			for _, raw := range tools {
+				if anonymousToolName(protocol, raw) == "patch" {
+					patch, _ = raw.(map[string]any)
+					if protocol == wire.Chat {
+						patch, _ = patch["function"].(map[string]any)
+					}
+					count++
+				}
+			}
+			if count != 1 || !strings.HasPrefix(patch["description"].(string), "Use the `patch` tool to edit files.") {
+				t.Fatalf("expected one genuine patch definition, got %v", patch)
+			}
+			field := "parameters"
+			if protocol == wire.Anthropic {
+				field = "input_schema"
+			}
+			schema, _ := patch[field].(map[string]any)
+			properties, _ := schema["properties"].(map[string]any)
+			patchText, _ := properties["patchText"].(map[string]any)
+			if patchText["description"] != "The full patch text describing add, update, and delete operations" || patchText["type"] != "string" {
+				t.Fatalf("patchText schema differs from v1.4.3: %v", patchText)
+			}
+		})
 	}
 }

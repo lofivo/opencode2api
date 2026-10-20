@@ -227,8 +227,8 @@ Khi `anonymous: true`, chỉ cần một trong hai điều kiện sau là mô h�
 
 Trình tự định tuyến là:
 
-1. Với mô hình đủ điều kiện, thử lần lượt mỗi proxy ẩn danh khả dụng. Khi gặp 403, tạo session và `msg_` mới, ưu tiên đầu ra kế tiếp và thử lại tối đa hai lần trước khi dự phòng. Lần thử lại chỉ dùng lại đầu ra cuối khi không còn đầu ra chưa thử.
-2. Thử các tier có xác thực theo thứ tự `prefer`, chỉ dùng những tier có key được cấu hình và có route cho mô hình đó.
+1. Với mô hình đủ điều kiện, thử làn ẩn danh, ưu tiên v2 `/inference` tại mỗi đầu ra rồi dự phòng về v1 `/zen`. Nếu kết quả vẫn là 403, tạo mới session chính, các session cha/con hiện có và `msg_`, ưu tiên đầu ra kế tiếp và thử lại tối đa hai lần trước khi dự phòng. Lần thử lại chỉ dùng lại đầu ra cuối khi không còn đầu ra chưa thử.
+2. Thử các tier có xác thực theo thứ tự `prefer`, chỉ dùng những tier có key được cấu hình và có route cho mô hình đó. Các lần thử này dùng danh tính gốc được suy ra từ request của client, không dùng danh tính đã luân chuyển ở làn ẩn danh.
 3. Áp dụng `retry.max_attempts` riêng cho từng tier có xác thực.
 
 Các lần thử ẩn danh không bị `retry.max_attempts` cắt ngắn, nhưng mọi lần thử đều dùng chung timeout của request. Lỗi mạng, xác thực thất bại, giới hạn tần suất và lỗi máy chủ có thể làm luân chuyển key. Các phản hồi 4xx khác kết thúc tier hiện tại; một tier khác còn khả dụng vẫn có thể được thử.
@@ -280,7 +280,7 @@ Xem [config.example.json](config.example.json) để có một cấu hình khở
 | `prefer`                   | `go`; nhận `go` hoặc `zen`.                                      |
 | `upstream.zen`             | `https://opencode.ai/zen`.                                       |
 | `upstream.go`              | `https://opencode.ai/zen/go`.                                    |
-| `upstream.anonymous`       | `https://opencode.ai/inference`; upstream dự phòng của kênh ẩn danh sau `/zen`. |
+| `upstream.anonymous`       | `https://opencode.ai/inference`; kênh ẩn danh thử trước, dự phòng về `/zen`. |
 | `proxies`                  | Rơi về `["direct"]` khi cả hai nguồn proxy đều rỗng.              |
 | `proxyfile`                | Không bắt buộc; đường dẫn tương đối được phân giải cạnh file cấu hình. |
 | `models.refresh_seconds`   | `300`; tối thiểu 1.                                              |

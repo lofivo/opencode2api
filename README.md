@@ -223,8 +223,8 @@ Eligibility is a routing decision; the upstream can still reject or rate-limit t
 
 The routing sequence is:
 
-1. For an eligible model, try each available anonymous proxy once. On a 403, rotate to a fresh constructed session and `msg_` request ID, prefer the next exit, and retry at most twice before falling back. A session retry reuses the last exit only when no untried exit remains.
-2. Try authenticated tiers in `prefer` order, using only tiers with a configured key and a route for that model.
+1. For an eligible model, try the anonymous lane, preferring v2 `/inference` at each exit and falling back to v1 `/zen`. If the result is still a 403, rotate the main session, any parent/child sessions, and the `msg_` request ID, prefer the next exit, and retry at most twice before falling back. A session retry reuses the last exit only when no untried exit remains.
+2. Try authenticated tiers in `prefer` order, using only tiers with a configured key and a route for that model. These attempts use the original identity derived from the client request, not the rotated anonymous identity.
 3. Apply `retry.max_attempts` separately to each authenticated tier.
 
 Anonymous attempts are not cut short by `retry.max_attempts`, but all attempts share the request timeout. Network errors, authentication failures, rate limits, and server errors can rotate keys. Other 4xx responses end the current tier; another available tier may still be tried.
@@ -276,7 +276,7 @@ See [config.example.json](config.example.json) for a complete starting configura
 | `prefer`                    | `go`; accepts `go` or `zen`.                                                |
 | `upstream.zen`              | `https://opencode.ai/zen`.                                                  |
 | `upstream.go`               | `https://opencode.ai/zen/go`.                                               |
-| `upstream.anonymous`        | `https://opencode.ai/inference`; the anonymous lane's fallback after `/zen`. |
+| `upstream.anonymous`        | `https://opencode.ai/inference`; tried first by the anonymous lane, which falls back to `/zen`. |
 | `proxies`                   | Falls back to `["direct"]` when both proxy sources are empty.               |
 | `proxyfile`                 | Optional; relative paths resolve beside the configuration file.             |
 | `models.refresh_seconds`    | `300`; minimum 1.                                                           |
