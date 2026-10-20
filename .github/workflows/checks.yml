@@ -58,5 +58,5 @@ jobs:
           for f in webui/js/*.js webui/js/pages/*.js; do
             node --input-type=module --check < "$f" || { echo "syntax error: $f" >&2; exit 1; }
           done
-      - name: Check container entrypoint syntax
-        run: sh -n docker-entrypoint.sh
+      - name: Check shell script syntax
+        run: sh -n docker-entrypoint.sh build.sh start.sh stop.sh
