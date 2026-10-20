@@ -88,14 +88,31 @@ type AttemptCounts struct {
 	Failed  uint64 `json:"failed"`
 }
 
-// AttemptAggregate counts upstream attempts in total and per tier, channel and
-// upstream key.
+// AttemptAggregate counts upstream attempts in total and per tier (lane),
+// channel, upstream key, model, proxy exit and response status. Failures keeps
+// the status-by-lane/model/exit combinations so 403 session rejections and 429
+// rate limits can be told apart in the diagnostics view.
 type AttemptAggregate struct {
 	AttemptCounts
 	SuccessRate float64                  `json:"success_rate"`
 	Tiers       map[string]AttemptCounts `json:"tiers"`
 	Channels    map[string]AttemptCounts `json:"channels"`
 	Keys        map[string]AttemptCounts `json:"keys"`
+	Models      map[string]AttemptCounts `json:"models"`
+	Proxies     map[string]AttemptCounts `json:"proxies"`
+	Statuses    map[string]AttemptCounts `json:"statuses"`
+	Failures    []AttemptFailure         `json:"failures,omitempty"`
+}
+
+// AttemptFailure is one failed-attempt combination. Count aggregates identical
+// status, lane, channel, model and exit tuples over the aggregate's time window.
+type AttemptFailure struct {
+	Status  int    `json:"status"`
+	Tier    string `json:"tier,omitempty"`
+	Channel string `json:"channel,omitempty"`
+	Model   string `json:"model,omitempty"`
+	Proxy   string `json:"proxy_node,omitempty"`
+	Count   uint64 `json:"count"`
 }
 
 // UpstreamAttempt is one upstream call made for a client request: one key or
@@ -121,21 +138,22 @@ type UpstreamAttempt struct {
 // because a single request can try several keys before it succeeds. A request
 // that never reached an upstream is recorded too, with Channel "not_routed".
 type UpstreamRequest struct {
-	Time        time.Time `json:"time"`
-	RequestID   string    `json:"request_id"`
-	Session     string    `json:"session,omitempty"`
-	ServerKeyID string    `json:"server_key_id,omitempty"`
-	Model       string    `json:"model"`
-	Tier        string    `json:"tier,omitempty"`
-	KeyID       string    `json:"key_id,omitempty"`
-	Channel     string    `json:"channel"`
-	Anonymous   bool      `json:"anonymous"`
-	Proxy       string    `json:"proxy_node,omitempty"`
-	Attempts    int       `json:"attempts"`
-	Status      int       `json:"status"`
-	DurationMS  int64     `json:"duration_ms"`
-	Success     bool      `json:"success"`
-	Outcome     string    `json:"outcome"`
+	Time           time.Time `json:"time"`
+	RequestID      string    `json:"request_id"`
+	Session        string    `json:"session,omitempty"`
+	ServerKeyID    string    `json:"server_key_id,omitempty"`
+	Model          string    `json:"model"`
+	Tier           string    `json:"tier,omitempty"`
+	KeyID          string    `json:"key_id,omitempty"`
+	Channel        string    `json:"channel"`
+	Anonymous      bool      `json:"anonymous"`
+	Proxy          string    `json:"proxy_node,omitempty"`
+	Attempts       int       `json:"attempts"`
+	SessionRetries int       `json:"session_retries,omitempty"`
+	Status         int       `json:"status"`
+	DurationMS     int64     `json:"duration_ms"`
+	Success        bool      `json:"success"`
+	Outcome        string    `json:"outcome"`
 }
 
 // attemptBucket holds the upstream attempts of one minute, like metricBucket.
@@ -379,7 +397,7 @@ func (m *Metrics) Record(endpoint string, status int, duration time.Duration, me
 			request := UpstreamRequest{
 				Time: time.Now().UTC(), RequestID: meta.Request, Session: meta.Session, ServerKeyID: meta.ServerKeyID, Model: meta.Model, Tier: meta.Tier,
 				KeyID: meta.KeyID, Channel: meta.Channel, Anonymous: meta.Anonymous, Proxy: meta.Proxy,
-				Attempts: meta.Attempts, Status: status, DurationMS: max(duration.Milliseconds(), 0),
+				Attempts: meta.Attempts, SessionRetries: meta.SessionRetries, Status: status, DurationMS: max(duration.Milliseconds(), 0),
 				Success: success,
 			}
 			if request.Channel == "" {
@@ -698,6 +716,7 @@ func finalizeUsagePeriod(period *UsagePeriod) {
 func attemptAggregate() AttemptAggregate {
 	return AttemptAggregate{
 		Tiers: make(map[string]AttemptCounts), Channels: make(map[string]AttemptCounts), Keys: make(map[string]AttemptCounts),
+		Models: make(map[string]AttemptCounts), Proxies: make(map[string]AttemptCounts), Statuses: make(map[string]AttemptCounts),
 	}
 }
 
@@ -706,6 +725,43 @@ func recordAttemptAggregate(target *AttemptAggregate, attempt UpstreamAttempt) {
 	addAttemptMap(target.Tiers, attempt.Tier, attempt.Success)
 	addAttemptMap(target.Channels, attempt.Channel, attempt.Success)
 	addAttemptMap(target.Keys, attempt.KeyID, attempt.Success)
+	addAttemptMap(target.Models, attempt.Model, attempt.Success)
+	addAttemptMap(target.Proxies, attempt.Proxy, attempt.Success)
+	addAttemptMap(target.Statuses, attemptStatusKey(attempt.Status), attempt.Success)
+	if !attempt.Success {
+		recordAttemptFailure(target, attempt)
+	}
+}
+
+// recordAttemptFailure adds one failed attempt to the status/lane/model/exit
+// breakdown, reusing an existing tuple when present.
+func recordAttemptFailure(target *AttemptAggregate, attempt UpstreamAttempt) {
+	mergeAttemptFailure(target, AttemptFailure{
+		Status: attempt.Status, Tier: attempt.Tier, Channel: attempt.Channel,
+		Model: attempt.Model, Proxy: attempt.Proxy, Count: 1,
+	})
+}
+
+func mergeAttemptFailure(target *AttemptAggregate, failure AttemptFailure) {
+	for i := range target.Failures {
+		current := &target.Failures[i]
+		if current.Status == failure.Status && current.Tier == failure.Tier &&
+			current.Channel == failure.Channel && current.Model == failure.Model &&
+			current.Proxy == failure.Proxy {
+			current.Count += failure.Count
+			return
+		}
+	}
+	target.Failures = append(target.Failures, failure)
+}
+
+// attemptStatusKey labels one response status in the aggregate. A zero status
+// means the attempt ended before any response arrived.
+func attemptStatusKey(status int) string {
+	if status == 0 {
+		return "transport_error"
+	}
+	return fmt.Sprint(status)
 }
 
 func recordAttemptCounts(target *AttemptCounts, success bool) {
@@ -733,6 +789,12 @@ func mergeAttemptAggregate(target *AttemptAggregate, source AttemptAggregate) {
 	mergeAttemptMaps(target.Tiers, source.Tiers)
 	mergeAttemptMaps(target.Channels, source.Channels)
 	mergeAttemptMaps(target.Keys, source.Keys)
+	mergeAttemptMaps(target.Models, source.Models)
+	mergeAttemptMaps(target.Proxies, source.Proxies)
+	mergeAttemptMaps(target.Statuses, source.Statuses)
+	for _, failure := range source.Failures {
+		mergeAttemptFailure(target, failure)
+	}
 }
 
 func mergeAttemptMaps(target, source map[string]AttemptCounts) {

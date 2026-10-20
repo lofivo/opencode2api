@@ -191,13 +191,70 @@ function renderRequests() {
           el("td", { text: request.tier || "—" }),
           el("td", { text: request.channel }),
           el("td", { text: request.key_id || "—" }),
-          el("td", { class: "num", text: request.attempts }),
+          el("td", {
+            class: "num",
+            text: request.session_retries
+              ? `${request.attempts} (+${request.session_retries})`
+              : request.attempts,
+          }),
           el("td", { class: request.success ? "ok" : "bad", text: result }),
           el("td", { class: "num", text: `${request.duration_ms} ms` }),
         ]),
       );
     });
   if (!host.children.length) emptyRow(host, 9, t("尚无请求路由", "diag.noRequests"));
+}
+
+function renderUpstreamSummary() {
+  const host = $("#upstream-summary");
+  if (!host) return;
+  const aggregate = store.get("monitor")?.upstream?.last_hour || {};
+  const statusName = (status) =>
+    status === "transport_error" ? t("传输错误", "diag.transportError") : status;
+  const statusOrder = (status) =>
+    status === "transport_error" ? Number.MAX_SAFE_INTEGER : Number(status) || 0;
+  const statuses = Object.entries(aggregate.statuses || {})
+    .sort(([a], [b]) => statusOrder(a) - statusOrder(b) || a.localeCompare(b))
+    .map(([status, counts]) => `${statusName(status)} ${formatNumber(counts.total)}`)
+    .join(" · ");
+  const failed = (map, format) =>
+    Object.entries(map || {})
+      .filter(([, counts]) => counts.failed > 0)
+      .sort(([, a], [, b]) => b.failed - a.failed)
+      .slice(0, 6)
+      .map(([name, counts]) => format(name, counts))
+      .join(" · ");
+  const statusFailures = (status) =>
+    (aggregate.failures || [])
+      .filter((failure) => Number(failure.status) === status)
+      .sort((a, b) => b.count - a.count)
+      .slice(0, 6)
+      .map((failure) => {
+        const route = [failure.tier, failure.channel, failure.model, failure.proxy_node]
+          .filter(Boolean)
+          .join(" · ");
+        return `${route || "—"} ×${formatNumber(failure.count)}`;
+      })
+      .join(" · ");
+  const none = t("无", "common.none");
+  renderFacts(host, [
+    [t("状态码", "diagnostics.upstream.status"), statuses || none],
+    [t("403 明细", "diagnostics.upstream.forbidden"), statusFailures(403) || none],
+    [t("429 明细", "diagnostics.upstream.rateLimited"), statusFailures(429) || none],
+    [
+      t("失败模型", "diagnostics.upstream.models"),
+      failed(aggregate.models, (name, counts) => `${name} ${formatNumber(counts.failed)}`) || none,
+    ],
+    [
+      t("失败出口", "diagnostics.upstream.proxies"),
+      failed(aggregate.proxies, (name, counts) => `${name} ${formatNumber(counts.failed)}`) || none,
+    ],
+    [
+      t("失败 lane", "diagnostics.upstream.lanes"),
+      failed(aggregate.tiers, (name, counts) => `${name} ${formatNumber(counts.failed)}/${formatNumber(counts.total)}`) ||
+        none,
+    ],
+  ]);
 }
 
 function renderAttempts() {
@@ -289,6 +346,7 @@ let activeTab = "playground";
 
 function renderLedger() {
   renderRequests();
+  renderUpstreamSummary();
   renderAttempts();
 }
 

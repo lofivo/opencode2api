@@ -229,6 +229,15 @@ const DICTIONARY = {
       "diagnostics.requests.title": "Request routing",
       "diagnostics.requests.caption":
         "The key tail or anonymous channel actually used per request; only the 100 most recent records are shown.",
+      "diagnostics.upstream.title": "Upstream health",
+      "diagnostics.upstream.caption":
+        "Last-hour totals by status, model, exit, and lane, so 403 session rejections and 429 rate limits stay distinct.",
+      "diagnostics.upstream.status": "Status codes",
+      "diagnostics.upstream.forbidden": "403 breakdown",
+      "diagnostics.upstream.rateLimited": "429 breakdown",
+      "diagnostics.upstream.models": "Failing models",
+      "diagnostics.upstream.proxies": "Failing exits",
+      "diagnostics.upstream.lanes": "Failing lanes",
       "diagnostics.attempts.title": "Upstream attempts",
       "diagnostics.attempts.caption":
         "Key tail, anonymous channel, and proxy node are masked; only the 100 most recent records are shown.",
@@ -467,6 +476,7 @@ const DICTIONARY = {
       "diag.clientCanceled": "Client canceled",
       "diag.noRequests": "No requests have been routed",
       "diag.noAttempts": "No upstream attempts",
+      "diag.transportError": "Transport error",
       "diag.noMatch": "No matching models",
 
       "quotas.noKey": "No Go Key configured",
@@ -775,6 +785,15 @@ const DICTIONARY = {
       "diagnostics.requests.title": "Định tuyến request",
       "diagnostics.requests.caption":
         "Đuôi Key hoặc anonymous thực sự được dùng cho từng request; hiển thị tối đa 100 bản ghi gần nhất.",
+      "diagnostics.upstream.title": "Sức khỏe upstream",
+      "diagnostics.upstream.caption":
+        "Tổng hợp một giờ gần nhất theo mã trạng thái, mô hình, đầu ra và lane, để phân biệt 403 với 429.",
+      "diagnostics.upstream.status": "Mã trạng thái",
+      "diagnostics.upstream.forbidden": "Chi tiết 403",
+      "diagnostics.upstream.rateLimited": "Chi tiết 429",
+      "diagnostics.upstream.models": "Mô hình lỗi",
+      "diagnostics.upstream.proxies": "Đầu ra lỗi",
+      "diagnostics.upstream.lanes": "Lane lỗi",
       "diagnostics.attempts.title": "Lần thử upstream",
       "diagnostics.attempts.caption":
         "Đuôi Key, kênh ẩn danh và nút proxy đã che; hiển thị tối đa 100 bản ghi gần nhất.",
@@ -1014,6 +1033,7 @@ const DICTIONARY = {
       "diag.clientCanceled": "Client đã huỷ",
       "diag.noRequests": "Chưa có request nào được định tuyến",
       "diag.noAttempts": "Chưa có lần thử upstream",
+      "diag.transportError": "Lỗi truyền tải",
       "diag.noMatch": "Không có mô hình phù hợp",
 
       "quotas.noKey": "Chưa cấu hình Go Key",
